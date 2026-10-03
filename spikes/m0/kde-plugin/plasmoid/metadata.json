@@ -1,0 +1,12 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Description": "M0.2 spike: shows the latest NDJSON frame from a Unix socket",
+        "Icon": "dialog-information",
+        "Id": "org.traytray.spike.m0",
+        "License": "MIT",
+        "Name": "Traytray M0 spike",
+        "Version": "0.0.1"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

@@ -1,0 +1,17 @@
+[package]
+name = "traytray-pipe-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone: not part of any workspace, no dependencies.
+[workspace]
+
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

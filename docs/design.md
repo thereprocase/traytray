@@ -90,8 +90,17 @@ See ADR 0001 for the choice of framing.
   - Events ≤ 10 per second, burst 50.
   - Every rendered string has its C0, ANSI and bidi control characters stripped and its length
     capped.
-- **Local transport:** a Unix socket at `$XDG_RUNTIME_DIR/traytray.sock` (mode 0600), or a named
-  pipe with a current-user DACL and a peer credential check.
+- **Local transport:**
+  - Linux: a Unix socket at `$XDG_RUNTIME_DIR/traytray.sock` (mode 0600) with an SO_PEERCRED uid
+    check.
+  - Windows: `\\.\pipe\traytray-<user SID>`. The DACL grants the current user and **denies
+    NETWORK**; the pipe is created with `FILE_FLAG_FIRST_PIPE_INSTANCE` and
+    `PIPE_REJECT_REMOTE_CLIENTS`. The client's identity is checked after its first frame is read
+    (Windows refuses the lookup before that). Clients open the pipe at identification level and
+    check the server's PID owner. Clients from another Windows session of the same user are
+    refused. (Spike M0.7 showed a same-user network-logon client gets in with a user-only DACL.)
+- **Oversized frames** are dropped and counted; the connection stays open. Readers bound every
+  buffer, including the socket library's own read buffer.
 - **Remote transport:**
   - TCP bound **only to the tailnet address**. It retries with backoff until that address
     exists, rebinds when it changes, and never falls back to another listener.
@@ -172,12 +181,19 @@ Unpairing deletes that app's feed. Every app has "Clear history".
 ## Drawer (may slip to beta)
 
 - **KDE:** the core registers as a StatusNotifierHost with Plasma's watcher, so it gets live
-  items. "Move to Plasma's overflow" is a user-clicked shell action that goes through
+  items. KDE's watcher emits each signal on three object paths; match `path=/StatusNotifierWatcher`
+  only. Item properties are optional and read one at a time. "Move to Plasma's overflow" is a user-clicked shell action that goes through
   plasmashell's scripting interface. The previous value is backed up first. It is never an
   API route.
-- **Windows:** the drawer lists the notification-icon settings entries. **Demote** ships only if
-  spike M0.4 shows it survives an Explorer restart and a sign-out. **Focus/launch** uses the
-  host-local verb.
+- **Windows:** the drawer lists the `NotifyIconSettings` entries (one per exe path; stale entries
+  remain for apps that aren't running, so liveness can't come from the registry alone;
+  `IconSnapshot` is the icon; `InitialTooltip` is not a reliable label). **Demote** writes
+  `IsPromoted` and applies live; it survived an Explorer kill and a sign-out (M0.4) but not an
+  exe-path change. **Focus/launch** uses the host-local verb and must handle paths that start with
+  a known-folder GUID.
+- **The host's own icon** starts in the Windows overflow like every new icon. First run offers
+  "Show in the taskbar corner", which sets `IsPromoted` on the host's own entry. A shell counts as
+  *visible* for robo-rightclick's handover only when that entry is promoted.
 
 ## Alpha app 1: agent sessions
 
@@ -196,9 +212,20 @@ Hook scripts only feed it:
 - **Hook config is executable code.** Changes to Claude Code settings and Codex `hooks.json`
   are diffs the user approves. Codex hook trust is granted by the user after review, never
   bypassed.
-- **Claude Code events:** SessionStart, UserPromptSubmit, PostToolUse (clears waiting),
-  Notification (by `notification_type`), PermissionDenied, Stop, StopFailure, SessionEnd.
-- **Codex:** hooks are the primary source. For sessions without hooks, the daemon reads the
+- **Claude Code events** (spike M0.5): PermissionRequest is the primary needs-you signal, with
+  Notification `permission_prompt` as a backup. Waiting clears on **any** later event from the
+  session (UserPromptSubmit, PreToolUse, PostToolUse, Stop) or when a pane re-read shows the
+  prompt is gone — a denied prompt sends no hook at all. Also SessionStart (records
+  `CLAUDE_PID`), Notification `idle_prompt`, StopFailure, SessionEnd.
+- **Hook timing:** only Notification, PostToolUse and SessionEnd run `async`; the others run
+  synchronously with a 2 s timeout (async Stop was lost in headless runs). The hook forwards the
+  environment variables that mark headless runs (`CLAUDE_CODE_ENTRYPOINT`,
+  `CLAUDE_CODE_SESSION_ATTENDED`), because the payload has no such field.
+- **Claude's feedback survey** ("1: Bad 2: Fine 3: Good 0: Dismiss") is a state with no reply box:
+  a reply starting with a digit would answer it.
+- **Codex:** hooks are the primary source once the user has added them and trusted them in the
+  Codex TUI (Review → trust, which records one trusted hash per hook in Codex's config). Codex has
+  no idle/notification hook and its SessionEnd reason is always `other`. For sessions without hooks, the daemon reads the
   tmux pane footer instead:
   - `Working (` → running
   - `Create a plan?` → waiting
@@ -225,15 +252,17 @@ Hook scripts only feed it:
    which by default holds only the local host. A remote host is added on the app's own
    machine. Replying into a `bypassPermissions` or `dontAsk` session from a remote host needs a
    separate opt-in for that host.
-2. **Pane check.** At registration the app records `{pane_id, pane_pid, pane_current_command}`.
-   Just before sending, it re-reads them and refuses (showing Open instead) unless the pane
-   still hosts that session's process.
+2. **Pane check.** At registration the app records `{pane_id, pane_pid}` and the agent's own PID
+   (`CLAUDE_PID` from the hook). Just before sending, it re-reads the pane and refuses (showing
+   Open instead) unless the agent PID is still alive and a descendant of the pane's process.
+   Command names are not trusted (`bash -c claude` reports `bash`).
 3. **No reply box during permission prompts or elicitation dialogs.** The tile shows Open
    instead.
 4. **Staleness.** A reply carries the `rev` it was typed against. If the session has moved on,
    the reply is rejected.
-5. **Delivery.** Control characters are stripped and the length is capped. The text is pasted
-   as one bracketed block (`tmux load-buffer` + `paste-buffer -p`), followed by Enter.
+5. **Delivery.** Control characters are stripped, CR becomes LF, and the length is capped. The
+   text is pasted as one bracketed block (`tmux load-buffer` + `paste-buffer -p`, never `-S`),
+   followed by Enter. The agents app never starts a tmux server; it only talks to existing ones.
 6. **Logging.** The app logs replies locally as length and hash only. The host logs nothing.
 
 ### Work machines

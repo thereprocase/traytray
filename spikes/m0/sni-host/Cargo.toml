@@ -1,0 +1,13 @@
+[package]
+name = "sni-host-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone crate: not part of any workspace in this repository.
+[workspace]
+
+[dependencies]
+zbus = { version = "=5.18.0", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures-util = { version = "0.3", default-features = false }
