@@ -4,6 +4,8 @@
 //! serde on `PairRecord`. The only secrets handled here are the 6-digit code and the bearer
 //! token; the token is returned once in `Granted` and only its SHA-256 is ever stored.
 
+use std::collections::VecDeque;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use traytray_proto::limits::MAX_NAME_CHARS;
@@ -23,9 +25,12 @@ pub const MAX_REQUESTS_GLOBAL: usize = 20;
 pub const MAX_CODE_ATTEMPTS: u8 = 3;
 pub const TOKEN_PREFIX: &str = "tt1_";
 
-/// Hard cap on remembered attempts. Once the global budget is spent every request is refused
-/// anyway, so dropping further entries cannot let anything through; it only bounds memory.
+/// Hard cap on remembered attempts; it only bounds memory. When full, the oldest entry is
+/// evicted, never the newest: a full history still holds at least `MAX_REQUESTS_GLOBAL`
+/// in-horizon attempts, so every request is refused, and the evicted entry is older than all
+/// kept ones, so the budget returns only after the most recent attempts age out.
 const MAX_HISTORY: usize = 256;
+const _: () = assert!(MAX_HISTORY >= MAX_REQUESTS_GLOBAL);
 /// Rejection sampling gives up after this many draws per digit, so a broken or constant
 /// random source fails loudly instead of hanging the daemon.
 const MAX_DRAWS_PER_DIGIT: usize = 256;
@@ -109,7 +114,7 @@ pub struct Pairing {
     pending: Option<Pending>,
     records: Vec<PairRecord>,
     /// (when, stable_node_id) of every counted request.
-    history: Vec<(Millis, String)>,
+    history: VecDeque<(Millis, String)>,
 }
 
 impl Pairing {
@@ -216,9 +221,10 @@ impl Pairing {
             .retain(|(t, _)| now.saturating_sub(*t) < RATE_WINDOW_MS);
         let per_node = self.history.iter().filter(|(_, n)| n == node).count();
         let global = self.history.len();
-        if self.history.len() < MAX_HISTORY {
-            self.history.push((now, node.to_owned()));
+        if self.history.len() >= MAX_HISTORY {
+            self.history.pop_front();
         }
+        self.history.push_back((now, node.to_owned()));
         per_node < MAX_REQUESTS_PER_NODE && global < MAX_REQUESTS_GLOBAL
     }
 
@@ -595,6 +601,35 @@ mod tests {
             let _ = p.request(T0, &peer(&format!("n{i}")), req("a"), "x".into());
         }
         assert!(p.history.len() <= MAX_HISTORY);
+    }
+
+    #[test]
+    fn full_history_keeps_newest_attempts() {
+        let mut p = Pairing::new();
+        p.open_window(T0);
+        for i in 0..MAX_HISTORY {
+            let _ = p.request(T0, &peer("evil"), req("a"), format!("a{i}"));
+        }
+        // Hammer just before the first burst ages out; these must outlive that burst.
+        let hammer = T0 + RATE_WINDOW_MS - 1000;
+        p.close_window();
+        p.open_window(hammer);
+        for i in 0..1000 {
+            let _ = p.request(hammer, &peer("evil"), req("a"), format!("b{i}"));
+        }
+        let after_first_burst = T0 + RATE_WINDOW_MS;
+        p.close_window();
+        p.open_window(after_first_burst);
+        let again = p.request(after_first_burst, &peer("evil"), req("a"), "c".into());
+        assert_eq!(again.unwrap_err(), ErrorCode::RateLimited);
+        let other = p.request(after_first_burst, &peer("fresh"), req("a"), "d".into());
+        assert_eq!(other.unwrap_err(), ErrorCode::RateLimited);
+        // The budget does return once the hammering itself ages out.
+        let recovered = hammer + RATE_WINDOW_MS;
+        p.open_window(recovered);
+        assert!(p
+            .request(recovered, &peer("evil"), req("a"), "e".into())
+            .is_ok());
     }
 
     #[test]
