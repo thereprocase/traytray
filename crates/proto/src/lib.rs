@@ -1,0 +1,1 @@
+//! Traytray protocol types.

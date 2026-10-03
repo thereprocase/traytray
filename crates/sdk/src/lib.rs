@@ -1,0 +1,1 @@
+//! Traytray client SDK.

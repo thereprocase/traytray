@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/proto", "crates/core", "crates/sdk"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/thereprocase/traytray"
+rust-version = "1.95"
+
+# Exact pins. Every change here is its own commit naming crate, version, publish date and
+# any build script (see CLAUDE.md).
+[workspace.dependencies]
+anyhow = "=1.0.104"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
+sha2 = "=0.10.9"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
