@@ -9,3 +9,5 @@ artifacts/
 # Machine-local wrappers around the private test VM and private machines. Never commit paths, keys or hostnames.
 scripts/local/
 __pycache__/
+# Raw spike evidence that may show private names (screens, payload dumps). Summaries go in spikes/m0/results/.
+spikes/m0/private/
