@@ -1,0 +1,11 @@
+target/
+build/
+bin/
+obj/
+artifacts/
+*.user
+.vs/
+.qmlls.ini
+# Machine-local wrappers around the private test VM and private machines. Never commit paths, keys or hostnames.
+scripts/local/
+__pycache__/
