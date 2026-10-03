@@ -40,14 +40,36 @@ const FEED_SUFFIX: &str = ".jsonl";
 /// Marks feed names that carry a hash instead of the hex app id. `s`, `h` and `-` never occur
 /// in lowercase hex, so the two naming schemes cannot collide.
 const FEED_HASHED_MARK: &str = "sha256-";
+/// The file name limit of common filesystems (NAME_MAX on ext4, btrfs and tmpfs; every name
+/// here is ASCII, so NTFS's UTF-16 count is the same). Every name this module creates must
+/// fit, temp names included, or writes fail for some app ids and never for others.
+const MAX_NAME_BYTES: usize = 255;
 /// Longest app id, in bytes, that is spelled out in hex. 120 bytes is 240 hex digits, which
-/// with the prefix and suffix stays under the 255-byte file name limit of common filesystems.
-/// Longer ids (remote ids are `<app>@<node>`) are named by their SHA-256 instead.
+/// with the prefix and suffix stays within `MAX_NAME_BYTES`. Longer ids (remote ids are
+/// `<app>@<node>`) are named by their SHA-256 instead.
 const MAX_HEX_ID_BYTES: usize = 120;
 
 /// Every temp file this module creates starts with this, so a leftover is recognisable as
 /// ours, safe to delete, and never mistaken for one of the three contract files.
 pub const TEMP_PREFIX: &str = ".traytray-tmp.";
+
+/// A temp file name. It deliberately does not contain the target's name: a feed name can
+/// already be close to `MAX_NAME_BYTES`, and a temp name built on top of it would not fit,
+/// so every compaction of that feed would fail while the file kept growing.
+fn temp_file_name(pid: u32, seq: u64) -> String {
+    format!("{TEMP_PREFIX}{pid}.{seq}")
+}
+
+// Raising MAX_HEX_ID_BYTES or lengthening a prefix must not quietly push a name past the
+// limit; these fail the build instead. 10 and 20 are the most digits a u32 and a u64 take.
+const _: () = assert!(
+    FEED_PREFIX.len() + 2 * MAX_HEX_ID_BYTES + FEED_SUFFIX.len() <= MAX_NAME_BYTES,
+    "hex feed names must fit MAX_NAME_BYTES"
+);
+const _: () = assert!(
+    TEMP_PREFIX.len() + 10 + 1 + 20 <= MAX_NAME_BYTES,
+    "temp file names must fit MAX_NAME_BYTES"
+);
 
 #[cfg(unix)]
 const DIR_MODE: u32 = 0o700;
@@ -194,6 +216,23 @@ pub struct StateDir {
     /// Per feed file: lines on disk and whether the last one lacks its newline. Lets `append`
     /// decide when to prune without rereading the file on every event.
     feeds: HashMap<String, FeedFile>,
+    /// Makes every compaction fail with this error, for tests of the failure path that must
+    /// not depend on file permissions (which root ignores).
+    #[cfg(test)]
+    compaction_fault: Option<io::ErrorKind>,
+}
+
+/// The outcome of a successful `append`. Every variant means the entry is in the feed.
+#[derive(Debug)]
+pub enum Appended {
+    /// The entry was written and the file is still within twice the retention limit.
+    Written,
+    /// The entry was written and the file was rewritten to the newest entries.
+    Compacted,
+    /// The entry was written, but rewriting the file to the newest entries failed. The file
+    /// stays larger than the limit until a later append's compaction succeeds. Worth logging;
+    /// not a reason to append again.
+    CompactionFailed(io::Error),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -207,7 +246,13 @@ impl StateDir {
     /// a symlink, a directory, and owned by the current user. An existing directory with
     /// looser permissions is tightened, since only traytrayd should ever read it.
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
-        let path = path.into();
+        Self::open_checked(path.into(), current_uid)
+    }
+
+    /// `open` with the current user's uid supplied by `our_uid`, so tests can exercise the
+    /// owner rule on a directory they own instead of depending on how /tmp happens to be set
+    /// up on the machine running them.
+    fn open_checked(path: PathBuf, our_uid: fn(&Path) -> io::Result<u32>) -> io::Result<Self> {
         if !path.is_absolute() {
             return Err(invalid_input("state directory must be an absolute path"));
         }
@@ -227,13 +272,18 @@ impl StateDir {
             ));
         }
         // Ownership must be settled before anything is changed or deleted inside it.
-        check_owner(&path, &meta)?;
+        check_owner(&path, &meta, our_uid)?;
         #[cfg(unix)]
         if meta.mode() & 0o777 != DIR_MODE {
             fs::set_permissions(&path, fs::Permissions::from_mode(DIR_MODE))?;
         }
 
-        let dir = StateDir { path, feeds: HashMap::new() };
+        let dir = StateDir {
+            path,
+            feeds: HashMap::new(),
+            #[cfg(test)]
+            compaction_fault: None,
+        };
         dir.sweep_temp_files()?;
         Ok(dir)
     }
@@ -250,7 +300,12 @@ impl StateDir {
     ///
     /// Appends are not fsynced: the feed is a short memory, and losing the last few entries
     /// to a power cut costs less than a disk flush per event.
-    pub fn append(&mut self, entry: &FeedEntry) -> io::Result<()> {
+    ///
+    /// `Err` means the entry was not appended (though a failed write may have left part of a
+    /// line, which readers skip). Once the line is written the result is `Ok`, even if the
+    /// prune that follows fails: reporting that as an error would make a retrying caller
+    /// record the entry twice. A failed prune is retried by the next append.
+    pub fn append(&mut self, entry: &FeedEntry) -> io::Result<Appended> {
         if entry.app_id.is_empty() {
             return Err(invalid_input("feed entry has an empty app id"));
         }
@@ -277,10 +332,13 @@ impl StateDir {
         state.unterminated = false;
         self.feeds.insert(name.clone(), state);
 
-        if state.lines > 2 * FEED_EVENTS_PER_APP {
-            self.compact_feed(&name, &entry.app_id)?;
+        if state.lines <= 2 * FEED_EVENTS_PER_APP {
+            return Ok(Appended::Written);
         }
-        Ok(())
+        Ok(match self.compact_feed(&name, &entry.app_id) {
+            Ok(()) => Appended::Compacted,
+            Err(e) => Appended::CompactionFailed(e),
+        })
     }
 
     /// The newest `FEED_EVENTS_PER_APP` entries of an app's feed, oldest first. Lines that do
@@ -329,6 +387,12 @@ impl StateDir {
             out.extend_from_slice(raw);
             out.push(b'\n');
         }
+        #[cfg(test)]
+        let result = match self.compaction_fault {
+            Some(kind) => Err(io::Error::from(kind)),
+            None => self.write_atomic(name, &out),
+        };
+        #[cfg(not(test))]
         let result = self.write_atomic(name, &out);
         match result {
             Ok(()) => {
@@ -399,7 +463,7 @@ impl StateDir {
     /// never a mix: write a temp file in the same directory, fsync it, rename it over the
     /// target, then fsync the directory so the rename itself is durable.
     fn write_atomic(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
-        let temp = TempFile::create(&self.path, name)?;
+        let temp = TempFile::create(&self.path)?;
         let mut file = temp.file.as_ref().expect("temp file is open until committed");
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -427,9 +491,9 @@ struct TempFile {
 }
 
 impl TempFile {
-    fn create(dir: &Path, purpose: &str) -> io::Result<Self> {
+    fn create(dir: &Path) -> io::Result<Self> {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!("{TEMP_PREFIX}{purpose}.{}.{seq}", std::process::id()));
+        let path = dir.join(temp_file_name(std::process::id(), seq));
         let mut opts = OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
@@ -524,15 +588,31 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Refuses a directory owned by someone else. std exposes no `getuid`, and the project takes
-/// no libc dependency, so the current user's uid is learned from a probe file: a file we
-/// create is owned by our effective uid. In a directory we cannot write, the probe fails and
-/// so does `open`, which is the right outcome too.
+/// The current user's effective uid. std exposes no `getuid`, and the project takes no libc
+/// dependency, so it is learned from a probe file: a file we create is owned by our
+/// effective uid. In a directory we cannot write, the probe fails and so does `open`, which
+/// is the right outcome too.
 #[cfg(unix)]
-fn check_owner(dir: &Path, dir_meta: &fs::Metadata) -> io::Result<()> {
-    let probe = TempFile::create(dir, "probe")?;
-    let our_uid = probe.file.as_ref().expect("probe is open").metadata()?.uid();
-    drop(probe);
+fn current_uid(dir: &Path) -> io::Result<u32> {
+    let probe = TempFile::create(dir)?;
+    let uid = probe.file.as_ref().expect("probe is open").metadata()?.uid();
+    Ok(uid)
+}
+
+/// Windows has no uid; `check_owner` there never asks for one.
+#[cfg(not(unix))]
+fn current_uid(_dir: &Path) -> io::Result<u32> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "no uid on this platform"))
+}
+
+/// Refuses a directory owned by someone else.
+#[cfg(unix)]
+fn check_owner(
+    dir: &Path,
+    dir_meta: &fs::Metadata,
+    our_uid: fn(&Path) -> io::Result<u32>,
+) -> io::Result<()> {
+    let our_uid = our_uid(dir)?;
     if dir_meta.uid() != our_uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -550,7 +630,11 @@ fn check_owner(dir: &Path, dir_meta: &fs::Metadata) -> io::Result<()> {
 /// Windows: %LOCALAPPDATA% is created per user with an ACL limited to that user and SYSTEM.
 /// Checking the owner SID needs Win32 calls the project does not take a dependency for.
 #[cfg(not(unix))]
-fn check_owner(_dir: &Path, _dir_meta: &fs::Metadata) -> io::Result<()> {
+fn check_owner(
+    _dir: &Path,
+    _dir_meta: &fs::Metadata,
+    _our_uid: fn(&Path) -> io::Result<u32>,
+) -> io::Result<()> {
     Ok(())
 }
 
@@ -594,6 +678,18 @@ mod tests {
     impl Drop for Scratch {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl StateDir {
+        /// `append` for tests that expect every compaction to succeed, so a failed prune
+        /// cannot hide behind an `Ok`.
+        fn append_ok(&mut self, entry: &FeedEntry) -> io::Result<Appended> {
+            let result = self.append(entry);
+            if let Ok(Appended::CompactionFailed(e)) = &result {
+                panic!("compaction failed for {:?}: {e}", entry.app_id);
+            }
+            result
         }
     }
 
@@ -672,11 +768,11 @@ mod tests {
         let file = dir.path().join(feed_file_name("app"));
 
         for n in 1..=2 * FEED_EVENTS_PER_APP {
-            dir.append(&event("app", n)).unwrap();
+            dir.append_ok(&event("app", n)).unwrap();
         }
         assert_eq!(line_count(&file), 2 * FEED_EVENTS_PER_APP, "no prune until exceeded");
 
-        dir.append(&event("app", 2 * FEED_EVENTS_PER_APP + 1)).unwrap();
+        dir.append_ok(&event("app", 2 * FEED_EVENTS_PER_APP + 1)).unwrap();
         assert_eq!(line_count(&file), FEED_EVENTS_PER_APP);
         let got = dir.read("app").unwrap();
         let want: Vec<String> = (FEED_EVENTS_PER_APP + 2..=2 * FEED_EVENTS_PER_APP + 1)
@@ -687,12 +783,73 @@ mod tests {
         assert!(names(&dir).iter().all(|n| !n.starts_with(TEMP_PREFIX)));
     }
 
+    /// Retention must hold for every app id length, in particular the longest ids still named
+    /// in hex, whose feed names leave the least room for anything built on top of them.
+    #[test]
+    fn retention_holds_at_the_hex_and_hash_name_boundary() {
+        let s = Scratch::new("boundary");
+        let mut dir = StateDir::open(s.state()).unwrap();
+        for len in [100, 110, 115, MAX_HEX_ID_BYTES, MAX_HEX_ID_BYTES + 1] {
+            let id = "r".repeat(len);
+            let file = dir.path().join(feed_file_name(&id));
+            for n in 1..=2 * FEED_EVENTS_PER_APP {
+                assert!(matches!(dir.append(&event(&id, n)), Ok(Appended::Written)), "len {len}");
+            }
+            let last = dir.append(&event(&id, 2 * FEED_EVENTS_PER_APP + 1));
+            assert!(matches!(last, Ok(Appended::Compacted)), "len {len}: {last:?}");
+            assert_eq!(line_count(&file), FEED_EVENTS_PER_APP, "len {len}");
+        }
+        assert!(names(&dir).iter().all(|n| !n.starts_with(TEMP_PREFIX)));
+    }
+
+    #[test]
+    fn every_name_the_module_creates_fits_the_file_name_limit() {
+        let longest_hex = feed_file_name(&"z".repeat(MAX_HEX_ID_BYTES));
+        let hashed = feed_file_name(&"z".repeat(MAX_HEX_ID_BYTES + 1));
+        let longest_temp = temp_file_name(u32::MAX, u64::MAX);
+        for name in [&longest_hex, &hashed, &longest_temp] {
+            assert!(name.len() <= MAX_NAME_BYTES, "{} bytes: {name}", name.len());
+        }
+        assert!(!hashed.contains(&hex(b"zz")), "long ids must be hashed: {hashed}");
+        assert_eq!(classify(&longest_temp), Some(FileKind::Temp));
+    }
+
+    /// A failed prune must not be reported as a failed append: the entry is on disk, and a
+    /// caller that retried on `Err` would record it twice.
+    #[test]
+    fn append_is_ok_when_only_the_prune_fails() {
+        let s = Scratch::new("prunefail");
+        let mut dir = StateDir::open(s.state()).unwrap();
+        let file = dir.path().join(feed_file_name("app"));
+        for n in 1..=2 * FEED_EVENTS_PER_APP {
+            dir.append_ok(&event("app", n)).unwrap();
+        }
+
+        dir.compaction_fault = Some(io::ErrorKind::StorageFull);
+        let over = 2 * FEED_EVENTS_PER_APP + 1;
+        match dir.append(&event("app", over)) {
+            Ok(Appended::CompactionFailed(e)) => assert_eq!(e.kind(), io::ErrorKind::StorageFull),
+            other => panic!("expected CompactionFailed, got {other:?}"),
+        }
+        assert_eq!(line_count(&file), over, "the entry was written exactly once");
+        assert_eq!(dir.read("app").unwrap().last().unwrap(), &event("app", over));
+
+        // The prune is retried by the next append, and succeeds once the fault clears.
+        assert!(matches!(dir.append(&event("app", over + 1)), Ok(Appended::CompactionFailed(_))));
+        assert_eq!(line_count(&file), over + 1);
+        dir.compaction_fault = None;
+        assert!(matches!(dir.append(&event("app", over + 2)), Ok(Appended::Compacted)));
+        assert_eq!(line_count(&file), FEED_EVENTS_PER_APP);
+        assert_eq!(dir.read("app").unwrap().last().unwrap(), &event("app", over + 2));
+        assert!(names(&dir).iter().all(|n| !n.starts_with(TEMP_PREFIX)));
+    }
+
     #[test]
     fn read_returns_at_most_the_retention_limit() {
         let s = Scratch::new("readcap");
         let mut dir = StateDir::open(s.state()).unwrap();
         for n in 1..=FEED_EVENTS_PER_APP + 5 {
-            dir.append(&event("app", n)).unwrap();
+            dir.append_ok(&event("app", n)).unwrap();
         }
         let got = dir.read("app").unwrap();
         assert_eq!(got.len(), FEED_EVENTS_PER_APP);
@@ -706,11 +863,11 @@ mod tests {
         {
             let mut dir = StateDir::open(s.state()).unwrap();
             for n in 1..=2 * FEED_EVENTS_PER_APP {
-                dir.append(&event("app", n)).unwrap();
+                dir.append_ok(&event("app", n)).unwrap();
             }
         }
         let mut dir = StateDir::open(s.state()).unwrap();
-        dir.append(&event("app", 0)).unwrap();
+        dir.append_ok(&event("app", 0)).unwrap();
         assert_eq!(line_count(&file), FEED_EVENTS_PER_APP);
     }
 
@@ -718,7 +875,7 @@ mod tests {
     fn corrupt_and_foreign_lines_are_skipped() {
         let s = Scratch::new("corrupt");
         let mut dir = StateDir::open(s.state()).unwrap();
-        dir.append(&event("app", 1)).unwrap();
+        dir.append_ok(&event("app", 1)).unwrap();
         let file = dir.path().join(feed_file_name("app"));
         let mut f = OpenOptions::new().append(true).open(&file).unwrap();
         f.write_all(b"{not json\n").unwrap();
@@ -729,7 +886,7 @@ mod tests {
 
         // A fresh StateDir has no cached line state, so it must notice the torn line itself.
         let mut dir = StateDir::open(s.state()).unwrap();
-        dir.append(&event("app", 2)).unwrap();
+        dir.append_ok(&event("app", 2)).unwrap();
         assert_eq!(event_ids(&dir.read("app").unwrap()), ["e1", "e2"]);
     }
 
@@ -742,7 +899,7 @@ mod tests {
             app_id: "app".into(),
             record: FeedRecord::Dismiss { item_id: "s1".into(), shell: "kde".into() },
         };
-        dir.append(&d).unwrap();
+        dir.append_ok(&d).unwrap();
         assert_eq!(dir.read("app").unwrap(), vec![d]);
     }
 
@@ -763,7 +920,7 @@ mod tests {
             long.as_str(),
         ];
         for (n, id) in ids.iter().enumerate() {
-            dir.append(&event(id, n)).unwrap();
+            dir.append_ok(&event(id, n)).unwrap();
         }
         let listed = dir.list_files().unwrap();
         assert_eq!(listed.len(), ids.len(), "every id gets its own file: {listed:?}");
@@ -786,7 +943,7 @@ mod tests {
     fn empty_app_id_is_refused() {
         let s = Scratch::new("empty");
         let mut dir = StateDir::open(s.state()).unwrap();
-        assert!(dir.append(&event("", 1)).is_err());
+        assert!(dir.append_ok(&event("", 1)).is_err());
         assert!(dir.list_files().unwrap().is_empty());
     }
 
@@ -794,8 +951,8 @@ mod tests {
     fn clear_and_delete_remove_the_feed() {
         let s = Scratch::new("clear");
         let mut dir = StateDir::open(s.state()).unwrap();
-        dir.append(&event("a", 1)).unwrap();
-        dir.append(&event("b", 1)).unwrap();
+        dir.append_ok(&event("a", 1)).unwrap();
+        dir.append_ok(&event("b", 1)).unwrap();
         dir.clear("a").unwrap();
         assert!(dir.read("a").unwrap().is_empty());
         assert_eq!(names(&dir), [feed_file_name("b")]);
@@ -803,7 +960,7 @@ mod tests {
         assert!(dir.list_files().unwrap().is_empty());
         dir.clear("never-existed").unwrap();
         // The cached line count must not outlive the file.
-        dir.append(&event("a", 2)).unwrap();
+        dir.append_ok(&event("a", 2)).unwrap();
         assert_eq!(event_ids(&dir.read("a").unwrap()), ["e2"]);
     }
 
@@ -883,8 +1040,35 @@ mod tests {
         }
     }
 
+    /// The owner rule with the uid lookup replaced, so it runs the same everywhere (as root, in
+    /// a sandbox whose /tmp the test user owns, in CI). The refusal must come before the
+    /// directory's mode is changed or anything in it is deleted.
+    #[cfg(unix)]
+    #[test]
+    fn open_refuses_a_directory_whose_owner_is_not_us_before_touching_it() {
+        let s = Scratch::new("owneruid");
+        drop(StateDir::open(s.state()).unwrap());
+        fs::set_permissions(s.state(), fs::Permissions::from_mode(0o755)).unwrap();
+        let stray = s.state().join(format!("{TEMP_PREFIX}1.1"));
+        fs::write(&stray, b"half").unwrap();
+
+        let someone_else = |dir: &Path| current_uid(dir).map(|uid| uid.wrapping_add(1));
+        let err = StateDir::open_checked(s.state(), someone_else).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("not owned by the current user"), "{err}");
+        assert_eq!(fs::metadata(s.state()).unwrap().mode() & 0o777, 0o755, "mode was changed");
+        assert!(stray.exists(), "a file was deleted from a directory we do not own");
+
+        // The same directory with the real uid is accepted, so the refusal above was the
+        // owner rule and not some other check.
+        StateDir::open_checked(s.state(), current_uid).unwrap();
+        assert!(!stray.exists());
+    }
+
     /// The system temp dir is usually root-owned and world-writable, which is exactly the
-    /// case the owner check exists for: the probe succeeds but belongs to someone else.
+    /// case the owner check exists for: the probe succeeds but belongs to someone else. This
+    /// runs the real uid lookup end to end where the machine allows it; the test above covers
+    /// the rule unconditionally.
     #[cfg(unix)]
     #[test]
     fn open_refuses_a_directory_owned_by_someone_else() {
@@ -906,7 +1090,7 @@ mod tests {
     fn permissions_are_private() {
         let s = Scratch::new("perms");
         let mut dir = StateDir::open(s.state()).unwrap();
-        dir.append(&event("app", 1)).unwrap();
+        dir.append_ok(&event("app", 1)).unwrap();
         dir.save_settings(&Settings::default()).unwrap();
         dir.save_pairings::<u8>(&[]).unwrap();
 
@@ -917,7 +1101,7 @@ mod tests {
         }
         // The compaction rewrite goes through a temp file too, so it must keep 0600.
         for n in 0..=2 * FEED_EVENTS_PER_APP {
-            dir.append(&event("app", n)).unwrap();
+            dir.append_ok(&event("app", n)).unwrap();
         }
         assert_eq!(mode(&dir.path().join(feed_file_name("app"))), 0o600);
 
@@ -927,7 +1111,7 @@ mod tests {
         fs::write(&loose, b"").unwrap();
         fs::set_permissions(&loose, fs::Permissions::from_mode(0o644)).unwrap();
         let mut dir = StateDir::open(s.state()).unwrap();
-        dir.append(&event("other", 1)).unwrap();
+        dir.append_ok(&event("other", 1)).unwrap();
         assert_eq!(mode(dir.path()), 0o700);
         assert_eq!(mode(&loose), 0o600);
     }
@@ -939,17 +1123,17 @@ mod tests {
         let s = Scratch::new("contract");
         let mut dir = StateDir::open(s.state()).unwrap();
         for n in 0..=2 * FEED_EVENTS_PER_APP {
-            dir.append(&event("local.agents", n)).unwrap();
+            dir.append_ok(&event("local.agents", n)).unwrap();
         }
-        dir.append(&event("robo@nREMOTE", 1)).unwrap();
-        dir.append(&FeedEntry {
+        dir.append_ok(&event("robo@nREMOTE", 1)).unwrap();
+        dir.append_ok(&FeedEntry {
             wall: 9,
             app_id: "local.agents".into(),
             record: FeedRecord::Dismiss { item_id: "s1".into(), shell: "kde".into() },
         })
         .unwrap();
         dir.clear("robo@nREMOTE").unwrap();
-        dir.append(&event("robo@nREMOTE", 2)).unwrap();
+        dir.append_ok(&event("robo@nREMOTE", 2)).unwrap();
         dir.save_settings(&Settings { muted: true, ..Settings::default() }).unwrap();
         dir.save_pairings(&[serde_json::json!({"app_id": "robo@nREMOTE"})]).unwrap();
 
