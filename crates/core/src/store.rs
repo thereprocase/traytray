@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use traytray_proto::limits::{
-    EVENT_BURST, EVENTS_PER_SEC, HEARTBEAT_SECS, MAX_NAME_CHARS, MISSED_HEARTBEATS_OFFLINE,
-    STATE_FANOUT_PER_SEC,
+    EVENT_BURST, EVENTS_PER_SEC, HEARTBEAT_SECS, MAX_BLOCKS, MAX_ITEMS, MAX_MENU_DEPTH,
+    MAX_NAME_CHARS, MISSED_HEARTBEATS_OFFLINE, STATE_FANOUT_PER_SEC,
 };
 use traytray_proto::sanitize::{clean, valid_id};
 use traytray_proto::validate::{self, Invalid};
@@ -23,6 +23,18 @@ use crate::{ConnId, Millis, UnixMillis};
 
 /// How many recent event ids each app's dedupe window holds.
 pub const RECENT_EVENT_IDS: usize = 1024;
+
+/// The origin the caller passes for apps on this machine; any other value is a paired node.
+pub const LOCAL_ORIGIN: &str = "local";
+
+/// Separates an app's own id from its node in a remote app id (`<app>@<node>`).
+const NAMESPACE_SEPARATOR: char = '@';
+
+/// Most offline entries kept. Each holds up to a frame's worth of state plus a dedupe window
+/// and is cloned into every snapshot, so an app that registers under a fresh id each run
+/// (a PID in the id, say) must not grow memory, snapshots and the badge without bound. Well
+/// above the handful of apps one desktop is expected to show.
+pub const MAX_OFFLINE_APPS: usize = 32;
 
 /// A connection that has been silent this long has missed `MISSED_HEARTBEATS_OFFLINE`
 /// heartbeats.
@@ -173,6 +185,23 @@ fn invalid_code(invalid: &Invalid) -> ErrorCode {
     }
 }
 
+/// Error text for a refused state document. `Invalid`'s own `Display` quotes the offending
+/// id, and state documents are never echoed into error bodies, so each variant maps to a fixed
+/// line. The match is exhaustive on purpose: a new variant must be given a message here.
+fn invalid_message(invalid: &Invalid) -> String {
+    match invalid {
+        Invalid::TooManyItems(_) => format!("state document has more than {MAX_ITEMS} items"),
+        Invalid::TooManyBlocks(_) => format!("state document has more than {MAX_BLOCKS} blocks"),
+        Invalid::MenuTooDeep => format!("menu nested deeper than {MAX_MENU_DEPTH}"),
+        Invalid::BadId(_) => "invalid id in state document".to_owned(),
+        Invalid::DuplicateId(_) => "duplicate item id in state document".to_owned(),
+        Invalid::BadNumber(_) => "number out of range in state document".to_owned(),
+        Invalid::TierNotGranted(_) => {
+            "state document uses a tier not granted to this app".to_owned()
+        }
+    }
+}
+
 fn wants_toast(event: &EventFrame) -> bool {
     event.urgency >= Urgency::NeedsYou || (event.urgency == Urgency::Notice && event.toast)
 }
@@ -261,6 +290,35 @@ impl Entry {
         });
     }
 
+    /// Connection-level flags that apply to every item shown for this app: those the state
+    /// was published under, and those of the current (or last) connection, which `dismiss`
+    /// already honours for the same items.
+    fn shown_privacy(&self) -> Privacy {
+        either(self.state_privacy, self.conn_privacy)
+    }
+
+    /// The state as shells receive it. `AppView` has no connection-level privacy field, so
+    /// the effective flags are folded into each item; otherwise a shell could not tell that
+    /// it holds ephemeral content and must suppress its own crash and log files.
+    fn shown_state(&self) -> AppState {
+        let conn = self.shown_privacy();
+        let mut state = self.state.clone();
+        for block in &mut state.blocks {
+            match block {
+                Block::Status { privacy, .. } | Block::Progress { privacy, .. } => {
+                    *privacy = either(*privacy, conn);
+                }
+                Block::List { rows, .. } => {
+                    for row in rows {
+                        row.privacy = either(row.privacy, conn);
+                    }
+                }
+                Block::Text { .. } | Block::Buttons { .. } | Block::Reply { .. } => {}
+            }
+        }
+        state
+    }
+
     fn view(&self, now: Millis) -> AppView {
         AppView {
             app_id: self.app_id.clone(),
@@ -273,7 +331,7 @@ impl Entry {
                 now.saturating_sub(self.last_seen) / 1000
             },
             rev: self.rev,
-            state: self.state.clone(),
+            state: self.shown_state(),
             tiers: self.tiers.clone(),
             volume: self.volume,
         }
@@ -332,9 +390,18 @@ impl Store {
             name = clean(app_id, MAX_NAME_CHARS, false);
         }
         let origin = clean(origin, MAX_NAME_CHARS, false);
+        // Remote ids are namespaced `<app>@<node>` by the host. A local app using that form
+        // could squat a remote app's id before it connects, or inherit its tile after.
+        if origin == LOCAL_ORIGIN && app_id.contains(NAMESPACE_SEPARATOR) {
+            return Err(ErrorCode::NotPermitted);
+        }
 
         match self.apps.get_mut(app_id) {
             Some(e) if e.online() => return Err(ErrorCode::AppIdTaken),
+            // The kept state, dismissals and volume belong to the origin that published them.
+            // Rebinding them under another origin would show one source's content behind
+            // another's host-drawn badge. A genuine change of origin goes through remove_app.
+            Some(e) if e.origin != origin => return Err(ErrorCode::NotPermitted),
             Some(e) => {
                 // A new connection starts a new rev epoch. The old state stays visible until
                 // the new one arrives, but only if it fits the tiers this connection holds.
@@ -343,7 +410,6 @@ impl Store {
                 e.conn = Some(conn);
                 e.rev = 0;
                 e.name = name;
-                e.origin = origin;
                 e.tiers = tiers.to_vec();
                 e.conn_privacy = privacy;
                 e.touch(now);
@@ -378,14 +444,34 @@ impl Store {
         Ok(())
     }
 
-    /// The connection closed. Its app goes offline; its state stays in memory as a stale tile.
-    /// A connection that no longer owns the app (it was rebound) changes nothing.
+    /// The connection closed. Its app goes offline; its state stays in memory as a stale tile,
+    /// up to `MAX_OFFLINE_APPS` such tiles. A connection that no longer owns the app (it was
+    /// rebound) changes nothing.
     pub fn disconnect(&mut self, conn: ConnId, now: Millis) {
         if let Some(e) = self.bound_mut(conn) {
             e.conn = None;
             e.touch(now);
             self.dirty = true;
+            self.evict_excess_offline();
         }
+    }
+
+    /// Drop the longest-unseen offline entries beyond `MAX_OFFLINE_APPS`. Run wherever an
+    /// entry goes offline, so the bound holds at all times. Ties break on app id, so the
+    /// result does not depend on anything but the store's contents.
+    fn evict_excess_offline(&mut self) {
+        let mut offline: Vec<(Millis, &String)> =
+            self.apps.values().filter(|e| !e.online()).map(|e| (e.last_seen, &e.app_id)).collect();
+        if offline.len() <= MAX_OFFLINE_APPS {
+            return;
+        }
+        offline.sort();
+        let excess = offline.len() - MAX_OFFLINE_APPS;
+        let doomed: Vec<String> = offline[..excess].iter().map(|(_, id)| (*id).clone()).collect();
+        for id in doomed {
+            self.apps.remove(&id);
+        }
+        self.dirty = true;
     }
 
     pub fn apply_state(
@@ -402,7 +488,7 @@ impl Store {
             return Ok(Ack { accepted: false, current_rev: e.rev });
         }
         let doc = validate::state(&frame.doc, &e.tiers)
-            .map_err(|invalid| (invalid_code(&invalid), invalid.to_string()))?;
+            .map_err(|invalid| (invalid_code(&invalid), invalid_message(&invalid)))?;
         e.rev = frame.rev;
         e.state = doc;
         e.state_privacy = e.conn_privacy;
@@ -467,6 +553,7 @@ impl Store {
         }
         if !gone.is_empty() {
             self.dirty = true;
+            self.evict_excess_offline();
         }
         gone
     }
@@ -735,13 +822,86 @@ mod tests {
 
     #[test]
     fn kept_state_is_cleared_if_the_new_connection_lacks_its_tiers() {
-        let mut s = store_with("a", 1, PLAIN);
+        let mut s = Store::new();
+        s.register(1, "a@n", "a", "node", ALL, PLAIN, 0).unwrap();
         s.apply_state(1, &one(1, "r", Urgency::Alert), 0).unwrap();
         s.disconnect(1, 0);
-        s.register(2, "a", "a", "node", &[Tier::Menu], PLAIN, 0).unwrap();
+        s.register(2, "a@n", "a", "node", &[Tier::Menu], PLAIN, 0).unwrap();
         let snap = s.snapshot(0);
         assert_eq!(snap.apps[0].state, AppState::default());
         assert_eq!(snap.icon_urgency, Urgency::Quiet);
+    }
+
+    #[test]
+    fn rebinding_an_offline_app_under_another_origin_is_refused() {
+        let mut s = Store::new();
+        s.register(1, "app@n1", "Agent", "node-1", ALL, PLAIN, 0).unwrap();
+        s.apply_state(1, &one(1, "r", Urgency::Notice), 0).unwrap();
+        s.disconnect(1, 0);
+
+        assert_eq!(
+            s.register(2, "app@n1", "Impostor", "node-2", ALL, PLAIN, 0),
+            Err(ErrorCode::NotPermitted)
+        );
+        let view = &s.snapshot(0).apps[0];
+        assert_eq!((view.name.as_str(), view.origin.as_str()), ("Agent", "node-1"));
+        assert!(!view.online);
+        assert_eq!(s.conn_of("app@n1"), None);
+
+        // The same origin may rebind and keeps its tile.
+        s.register(3, "app@n1", "Agent", "node-1", ALL, PLAIN, 0).unwrap();
+        assert_eq!(items(&s.snapshot(0).apps[0].state)[0].id, "r");
+    }
+
+    #[test]
+    fn local_apps_cannot_take_namespaced_ids() {
+        let mut s = Store::new();
+        assert_eq!(
+            s.register(1, "app@n1", "x", LOCAL_ORIGIN, ALL, PLAIN, 0),
+            Err(ErrorCode::NotPermitted)
+        );
+        assert!(s.snapshot(0).apps.is_empty(), "nothing squatted");
+        assert_eq!(s.app_of(1), None, "the refused connection stays unbound");
+        s.register(2, "app@n1", "x", "node-1", ALL, PLAIN, 0).unwrap();
+
+        // And a local hello cannot inherit a remote tile once its owner is offline.
+        s.apply_state(2, &one(1, "r", Urgency::Notice), 0).unwrap();
+        s.disconnect(2, 0);
+        assert_eq!(
+            s.register(3, "app@n1", "x", LOCAL_ORIGIN, ALL, PLAIN, 0),
+            Err(ErrorCode::NotPermitted)
+        );
+        assert_eq!(s.snapshot(0).apps[0].origin, "node-1");
+    }
+
+    #[test]
+    fn state_errors_do_not_echo_document_content() {
+        let mut s = store_with("a", 1, EPHEMERAL);
+        let dup = rows(
+            1,
+            vec![
+                row("patient-jane-doe", Urgency::Quiet, PLAIN),
+                row("patient-jane-doe", Urgency::Quiet, PLAIN),
+            ],
+        );
+        let (code, message) = s.apply_state(1, &dup, 0).unwrap_err();
+        assert_eq!(code, ErrorCode::BadFrame);
+        assert!(!message.contains("patient"), "{message}");
+
+        let bad = rows(2, vec![row("patient jane doe", Urgency::Quiet, PLAIN)]);
+        let (code, message) = s.apply_state(1, &bad, 0).unwrap_err();
+        assert_eq!(code, ErrorCode::BadFrame);
+        assert!(!message.contains("patient"), "{message}");
+
+        // Every variant that carries document text is covered, not just the two reachable
+        // from a hand-built frame above.
+        for invalid in [
+            Invalid::BadId("SECRET".into()),
+            Invalid::DuplicateId("SECRET".into()),
+            Invalid::BadNumber("SECRET"),
+        ] {
+            assert!(!invalid_message(&invalid).contains("SECRET"), "{invalid:?}");
+        }
     }
 
     #[test]
@@ -1041,6 +1201,38 @@ mod tests {
         assert_eq!(v.last_seen_secs, 60);
     }
 
+    #[test]
+    fn offline_entries_are_capped_oldest_first_and_online_apps_are_kept() {
+        let mut s = store_with("live", 0, PLAIN);
+        let extra = 10;
+        for i in 0..(MAX_OFFLINE_APPS + extra) as u64 {
+            let id = format!("run-{i}");
+            s.register(i + 1, &id, &id, LOCAL_ORIGIN, ALL, PLAIN, i).unwrap();
+            s.disconnect(i + 1, i);
+        }
+        let snap = s.snapshot(1_000);
+        assert_eq!(snap.apps.len(), MAX_OFFLINE_APPS + 1);
+        assert_eq!(snap.badge as usize, MAX_OFFLINE_APPS);
+        assert_eq!(s.conn_of("live"), Some(0));
+        for i in 0..extra {
+            assert!(!s.apps.contains_key(&format!("run-{i}")), "run-{i} should be evicted");
+        }
+        assert!(s.apps.contains_key(&format!("run-{extra}")));
+    }
+
+    #[test]
+    fn apps_going_offline_by_heartbeat_are_capped_too() {
+        let mut s = Store::new();
+        for i in 0..(MAX_OFFLINE_APPS + 3) as u64 {
+            let id = format!("run-{i}");
+            s.register(i, &id, &id, LOCAL_ORIGIN, ALL, PLAIN, i).unwrap();
+        }
+        let gone = s.tick(1_000_000);
+        assert_eq!(gone.len(), MAX_OFFLINE_APPS + 3);
+        assert_eq!(s.apps.len(), MAX_OFFLINE_APPS);
+        assert!(!s.apps.contains_key("run-0") && s.apps.contains_key("run-3"));
+    }
+
     // --- roll-up and dismissal ----------------------------------------------------------
 
     #[test]
@@ -1266,6 +1458,66 @@ mod tests {
         let json = serde_json::to_string(&s.snapshot(0)).unwrap();
         assert!(json.contains(r#""ephemeral":true"#), "{json}");
 
+        assert_no_disk_writes_in_store();
+    }
+
+    fn snapshot_json(s: &Store) -> String {
+        serde_json::to_string(&s.snapshot(0)).unwrap()
+    }
+
+    #[test]
+    fn connection_privacy_reaches_shells_on_every_item() {
+        let both = Privacy { ephemeral: true, private: true };
+        let mut s = store_with("a", 1, both);
+        let doc = AppState {
+            blocks: vec![
+                Block::Status {
+                    id: "s".into(),
+                    text: "secret status".into(),
+                    urgency: Urgency::Quiet,
+                    privacy: PLAIN,
+                },
+                Block::Progress {
+                    id: "p".into(),
+                    label: "secret copy".into(),
+                    value: None,
+                    eta_secs: None,
+                    urgency: Urgency::Quiet,
+                    privacy: PLAIN,
+                },
+                Block::List { id: "l".into(), rows: vec![row("r", Urgency::Notice, PLAIN)] },
+            ],
+            ..Default::default()
+        };
+        s.apply_state(1, &StateFrame { rev: 1, doc }, 0).unwrap();
+        assert!(s.holds_ephemeral());
+
+        let view = &s.snapshot(0).apps[0];
+        let shown = items(&view.state);
+        assert_eq!(shown.len(), 3);
+        for item in shown {
+            assert_eq!(item.privacy, both, "item {}", item.id);
+        }
+        // The store keeps what the app sent; only the view carries the folded flags.
+        assert!(items(&s.apps["a"].state).iter().all(|i| i.privacy == PLAIN));
+    }
+
+    #[test]
+    fn ephemeral_state_kept_across_a_rebind_is_still_flagged_for_shells() {
+        let mut s = store_with("a", 1, EPHEMERAL);
+        s.apply_state(1, &one(1, "job", Urgency::Notice), 0).unwrap();
+        s.disconnect(1, 0);
+        assert!(snapshot_json(&s).contains(r#""ephemeral":true"#), "offline tile");
+
+        s.register(2, "a", "a", LOCAL_ORIGIN, ALL, PLAIN, 0).unwrap();
+        assert!(snapshot_json(&s).contains(r#""ephemeral":true"#), "rebound, not republished");
+
+        s.apply_state(2, &one(1, "job", Urgency::Notice), 0).unwrap();
+        assert!(!snapshot_json(&s).contains("ephemeral"), "{}", snapshot_json(&s));
+        assert!(!s.holds_ephemeral());
+    }
+
+    fn assert_no_disk_writes_in_store() {
         // The store's only output toward disk is FeedEntry values. Check that the non-test
         // part of this file has no way to write anything itself.
         let source = include_str!("store.rs");
